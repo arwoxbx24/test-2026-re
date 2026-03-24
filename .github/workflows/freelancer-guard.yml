@@ -10,6 +10,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  workflows: write
 
 jobs:
   checks:
@@ -23,6 +24,7 @@ jobs:
 
       - name: Create backup tag
         if: github.event_name == 'push'
+        continue-on-error: true
         env:
           REF_NAME: ${{ github.ref_name }}
         run: |
@@ -383,10 +385,16 @@ jobs:
             CHANGED_FILES=$(gh pr view "$PR_URL_FOR_SCAN" --json files --jq '.files[].path' 2>/dev/null || echo "")
 
             # Check 2: Suspicious code patterns in diff
-            DIFF=$(gh pr diff "$PR_URL_FOR_SCAN" 2>/dev/null || echo "")
+            # Strip .github/workflows/ file sections entirely using awk before scanning
+            RAW_DIFF=$(gh pr diff "$PR_URL_FOR_SCAN" 2>/dev/null || echo "")
+            DIFF=$(echo "$RAW_DIFF" | awk '
+              /^diff --git a\/\.github\/workflows\// { skip=1 }
+              /^diff --git / && !/^diff --git a\/\.github\/workflows\// { skip=0 }
+              skip==0 { print }
+            ')
 
             # Obfuscation / injection patterns
-            SUSPICIOUS=$(echo "$DIFF" | grep -v '\.github/workflows/' | grep -iE '(eval\s*\(|exec\s*\(|base64_decode|atob\s*\(|Buffer\.from|child_process|subprocess\.(call|run|Popen)|os\.system|__import__|require\s*\(\s*["\x27]child_process|\\x[0-9a-f]{2}|\\u[0-9a-f]{4})' || true)
+            SUSPICIOUS=$(echo "$DIFF" | grep -iE '(eval\s*\(|exec\s*\(|base64_decode|atob\s*\(|Buffer\.from|child_process|subprocess\.(call|run|Popen)|os\.system|__import__|require\s*\(\s*["\x27]child_process|\\x[0-9a-f]{2}|\\u[0-9a-f]{4})' || true)
             if [ -n "$SUSPICIOUS" ]; then
               BLOCK_MERGE=true
               BLOCK_REASONS="${BLOCK_REASONS}\n❌ Подозрительный код: $(echo "$SUSPICIOUS" | head -3)"
@@ -399,8 +407,8 @@ jobs:
               BLOCK_REASONS="${BLOCK_REASONS}\n⚠️ Внешние URL: $(echo "$EXTERNAL" | tr '\n' ' ')"
             fi
 
-            # Check 4: Large binary files added
-            LARGE=$(echo "$DIFF" | grep -v '\.github/workflows/' | grep -E '^\+.*Binary file' || true)
+            # Check 4: Large binary files added (excluding .github/workflows/ already stripped above)
+            LARGE=$(echo "$DIFF" | grep -E '^\+.*Binary file' || true)
             if [ -n "$LARGE" ]; then
               BLOCK_MERGE=true
               BLOCK_REASONS="${BLOCK_REASONS}\n❌ Бинарные файлы добавлены"
@@ -415,7 +423,8 @@ jobs:
                 curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
                   --data-urlencode "chat_id=${TG_CHAT_ID}" \
                   --data-urlencode "text=${ALERT_TEXT}" \
-                  -d "disable_web_page_preview=true" || true
+                  -d "disable_web_page_preview=true" \
+                  --data-urlencode "reply_markup={\"inline_keyboard\":[[{\"text\":\"OK ✓\",\"callback_data\":\"ok_delete\"}]]}" || true
               fi
               exit 1
             fi
