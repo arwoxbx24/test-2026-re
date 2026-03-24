@@ -78,6 +78,7 @@ jobs:
 
       - name: Check for force push
         if: github.event_name == 'push' && github.event.forced == true && github.ref != 'refs/heads/main'
+        continue-on-error: true
         env:
           ACTOR: ${{ github.actor }}
           REF_NAME: ${{ github.ref_name }}
@@ -90,6 +91,7 @@ jobs:
 
       - name: Check diff size
         if: github.event_name == 'push'
+        continue-on-error: true
         env:
           BEFORE: ${{ github.event.before }}
         run: |
@@ -102,6 +104,7 @@ jobs:
 
       - name: Check commit count
         if: github.event_name == 'push'
+        continue-on-error: true
         env:
           BEFORE: ${{ github.event.before }}
         run: |
@@ -114,6 +117,7 @@ jobs:
 
       - name: Check large files
         if: github.event_name == 'push'
+        continue-on-error: true
         env:
           BEFORE: ${{ github.event.before }}
         run: |
@@ -128,25 +132,31 @@ jobs:
             done)
             if [ -n "$LARGE" ]; then
               echo "::error::Large files (>50MB) detected: $LARGE"
-              exit 1
+              echo "BLOCK_PUSH=true" >> $GITHUB_ENV
+              echo "BLOCK_REASON=Large file over 50MB: $LARGE" >> $GITHUB_ENV
             fi
           fi
 
       - name: Scan for obfuscation
         if: github.event_name == 'push'
+        continue-on-error: true
         env:
           BEFORE: ${{ github.event.before }}
         run: |
           if [ "${BEFORE}" != "0000000000000000000000000000000000000000" ]; then
             DIFF=$(git diff "${BEFORE}".."${GITHUB_SHA}" -- . ':!.github/workflows/' 2>/dev/null || true)
-            if echo "$DIFF" | grep -qE '(eval\s*\(\s*base64_decode|base64_decode\s*\(|eval\s*\(\s*atob|atob\s*\(|eval\s*\(\s*gzinflate|gzinflate\s*\(|child_process|subprocess|__import__|preg_replace\s*\(.*/e|\\x[0-9a-f]{2}.*\\x[0-9a-f]{2}.*\\x[0-9a-f]{2})'; then
-              echo "::error::OBFUSCATED CODE PATTERN DETECTED in push"
-              exit 1
+            if [ -n "$DIFF" ]; then
+              if echo "$DIFF" | grep -qE '(base64_decode\s*\(|atob\s*\(|gzinflate\s*\(|child_process|subprocess|__import__|preg_replace\s*\(.*/e|\\x[0-9a-f]{2}.*\\x[0-9a-f]{2}.*\\x[0-9a-f]{2})'; then
+                echo "::error::Obfuscated/dangerous code patterns detected"
+                echo "BLOCK_PUSH=true" >> $GITHUB_ENV
+                echo "BLOCK_REASON=Obfuscated or dangerous code patterns detected" >> $GITHUB_ENV
+              fi
             fi
           fi
 
       - name: Check dangerous file extensions
-        if: always() && github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000'
+        if: github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000'
+        continue-on-error: true
         env:
           BEFORE: ${{ github.event.before }}
         run: |
@@ -163,7 +173,6 @@ jobs:
             echo "$TIER1"
             echo "BLOCK_PUSH=true" >> $GITHUB_ENV
             echo "BLOCK_REASON=Tier 1 dangerous extensions: $TIER1" >> $GITHUB_ENV
-            exit 1
           fi
 
           # Tier 2: SMART BLOCK — block outside safe paths
@@ -175,7 +184,6 @@ jobs:
               echo "$UNSAFE"
               echo "BLOCK_PUSH=true" >> $GITHUB_ENV
               echo "BLOCK_REASON=Tier 2 binaries outside safe paths: $UNSAFE" >> $GITHUB_ENV
-              exit 1
             else
               echo "::warning::Binary files in safe paths (allowed): $TIER2"
             fi
@@ -184,23 +192,44 @@ jobs:
           echo "Extension check passed"
 
       - name: Rollback dangerous push
-        if: failure() && github.event_name == 'push' && github.ref != 'refs/heads/main'
+        if: env.BLOCK_PUSH == 'true' && github.event_name == 'push' && github.ref != 'refs/heads/main'
         env:
           BEFORE: ${{ github.event.before }}
         run: |
           if [ "${BEFORE}" != "0000000000000000000000000000000000000000" ]; then
             echo "Rolling back dangerous commit on ${GITHUB_REF}..."
-            git push --force origin "${BEFORE}:${GITHUB_REF}" || echo "::warning::Rollback failed"
+            git push --force origin "${BEFORE}:${GITHUB_REF}" || echo "::warning::Rollback failed - manual intervention required"
             echo "Commit rolled back to ${BEFORE}"
           fi
 
       - name: Verify guard file integrity
-        if: always() && github.event_name == 'push'
+        if: github.event_name == 'push'
+        continue-on-error: true
         run: |
           if [ ! -f ".github/workflows/freelancer-guard.yml" ]; then
             echo "::error::Guard workflow file deleted! This is a security violation."
-            exit 1
+            echo "BLOCK_PUSH=true" >> $GITHUB_ENV
+            echo "BLOCK_REASON=Guard workflow file was deleted" >> $GITHUB_ENV
           fi
+
+      - name: Telegram security alert
+        if: env.BLOCK_PUSH == 'true'
+        env:
+          TG_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          MSG="🚨 SECURITY BLOCK in ${{ github.repository }}%0A%0ABranch: ${GITHUB_REF#refs/heads/}%0AReason: ${BLOCK_REASON}%0ACommit: ${GITHUB_SHA:0:7}%0AAction: Rolled back"
+          curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            -d "chat_id=${TG_CHAT}" \
+            -d "text=${MSG}" \
+            -d "parse_mode=HTML" \
+            --data-urlencode 'reply_markup={"inline_keyboard":[[{"text":"OK ✓","callback_data":"ok_delete"}]]}' || true
+
+      - name: Fail on security violation
+        if: env.BLOCK_PUSH == 'true'
+        run: |
+          echo "::error::Security violation: ${BLOCK_REASON}"
+          exit 1
 
   merge:
     needs: checks
@@ -300,7 +329,8 @@ jobs:
               curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
                 --data-urlencode "chat_id=${TG_CHAT_ID}" \
                 --data-urlencode "text=LLM BLOCKED merge in ${REPO}: ${LLM_REASON}" \
-                -d "disable_web_page_preview=true" || true
+                -d "disable_web_page_preview=true" \
+                --data-urlencode 'reply_markup={"inline_keyboard":[[{"text":"OK ✓","callback_data":"ok_delete"}]]}' || true
             fi
             exit 1
           else
@@ -512,7 +542,8 @@ jobs:
                 curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
                   --data-urlencode "chat_id=${TG_CHAT_ID}" \
                   --data-urlencode "text=${TG_MSG}" \
-                  -d "disable_web_page_preview=true" || true
+                  -d "disable_web_page_preview=true" \
+                  --data-urlencode 'reply_markup={"inline_keyboard":[[{"text":"OK ✓","callback_data":"ok_delete"}]]}' || true
               fi
             else
               echo "LLM summary unavailable (both APIs failed)"
@@ -531,13 +562,7 @@ jobs:
         run: |
           PR_NUMBER=$(gh pr list --head "${REF_NAME}" --json number --jq '.[0].number' 2>/dev/null || echo "")
           if [ -n "$PR_NUMBER" ]; then
-            gh pr comment "$PR_NUMBER" --body "Checks failed. Fix errors and push again. See Actions logs."
-          fi
-          if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
-            curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-              --data-urlencode "chat_id=${TG_CHAT_ID}" \
-              --data-urlencode "text=ROLLBACK/FAILURE in ${REPO} on ${REF_NAME}. Check Actions logs." \
-              -d "disable_web_page_preview=true" || true
+            gh pr comment "$PR_NUMBER" --body "Checks failed. Fix errors and push again. See Actions logs." 2>/dev/null || true
           fi
 
   notify-delete:
