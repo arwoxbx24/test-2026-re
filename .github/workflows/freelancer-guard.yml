@@ -192,7 +192,7 @@ jobs:
           echo "Extension check passed"
 
       - name: Rollback dangerous push
-        if: env.BLOCK_PUSH == 'true' && github.event_name == 'push' && github.ref != 'refs/heads/main'
+        if: ${{ env.BLOCK_PUSH == 'true' && github.event_name == 'push' && github.ref != 'refs/heads/main' }}
         env:
           BEFORE: ${{ github.event.before }}
         run: |
@@ -213,7 +213,7 @@ jobs:
           fi
 
       - name: Telegram security alert
-        if: env.BLOCK_PUSH == 'true'
+        if: ${{ env.BLOCK_PUSH == 'true' }}
         env:
           TG_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT: ${{ secrets.TG_CHAT_ID }}
@@ -229,7 +229,7 @@ jobs:
             --data-urlencode "reply_markup=${REPLY_MARKUP}" || true
 
       - name: Fail on security violation
-        if: env.BLOCK_PUSH == 'true'
+        if: ${{ env.BLOCK_PUSH == 'true' }}
         run: |
           echo "::error::Security violation: ${BLOCK_REASON}"
           exit 1
@@ -255,7 +255,7 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           REPO: ${{ github.repository }}
-          REPLY_MARKUP: '{"inline_keyboard":[[{"text":"OK \u2713","callback_data":"ok_delete"}]]}'
+          REPLY_MARKUP: '{"inline_keyboard":[[{"text":"OK ✓","callback_data":"ok_delete"}]]}'
         run: |
           if [ "${BEFORE}" = "0000000000000000000000000000000000000000" ]; then
             echo "First push - skipping LLM review"
@@ -383,7 +383,7 @@ jobs:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           TIMEWEB_AI_KEY: ${{ secrets.TIMEWEB_AI_KEY }}
           BEFORE: ${{ github.event.before }}
-          REPLY_MARKUP: '{"inline_keyboard":[[{"text":"OK \u2713","callback_data":"ok_delete"}]]}'
+          REPLY_MARKUP: '{"inline_keyboard":[[{"text":"OK ✓","callback_data":"ok_delete"}]]}'
         run: |
           EXISTING_PR=$(gh pr list --base main --head dev --json number --jq '.[0].number' 2>/dev/null || echo "")
 
