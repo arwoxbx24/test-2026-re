@@ -218,9 +218,10 @@ jobs:
           TG_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT: ${{ secrets.TG_CHAT_ID }}
           REPO: ${{ github.repository }}
-          REPLY_MARKUP: '{"inline_keyboard":[[{"text":"OK \u2713","callback_data":"ok_delete"}]]}'
+          BLOCK_REASON: ${{ env.BLOCK_REASON }}
         run: |
-          MSG="🚨 SECURITY BLOCK in ${REPO}%0A%0ABranch: ${GITHUB_REF#refs/heads/}%0AReason: ${BLOCK_REASON}%0ACommit: ${GITHUB_SHA:0:7}%0AAction: Rolled back"
+          REPLY_MARKUP='{"inline_keyboard":[[{"text":"OK","callback_data":"ok_delete"}]]}'
+          MSG="SECURITY BLOCK in ${REPO}%0A%0ABranch: ${GITHUB_REF#refs/heads/}%0AReason: ${BLOCK_REASON}%0ACommit: ${GITHUB_SHA:0:7}%0AAction: Rolled back"
           curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
             -d "chat_id=${TG_CHAT}" \
             -d "text=${MSG}" \
