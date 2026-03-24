@@ -1,0 +1,288 @@
+name: Freelancer Guard
+
+on:
+  push:
+    branches: ['**']
+  delete:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create backup tag
+        if: github.event_name == 'push'
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          BRANCH=$(echo "${REF_NAME}" | tr '/' '-')
+          TAG="backup/${BRANCH}/$(date -u +%Y%m%d-%H%M%S)-${GITHUB_SHA::7}"
+          git tag "$TAG"
+          git push origin "$TAG" 2>/dev/null || echo "Tag push failed (might already exist)"
+
+      - name: Rollback main branch push
+        if: |
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/main' &&
+          !contains(github.actor, 'github-actions')
+        env:
+          ACTOR: ${{ github.actor }}
+          BEFORE_SHA: ${{ github.event.before }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "::warning::Push to main detected by ${ACTOR} - initiating rollback"
+
+          PREV_TAG=$(git tag --sort=-creatordate | grep "^backup/main/" | grep -v "${GITHUB_SHA::7}" | head -1)
+
+          if [ -z "$PREV_TAG" ]; then
+            if [ "${BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]; then
+              ROLLBACK_SHA="${BEFORE_SHA}"
+              echo "No previous backup tag found, rolling back to before-SHA: ${ROLLBACK_SHA}"
+            else
+              echo "::error::Cannot rollback — no previous state found (first push to main)"
+              exit 0
+            fi
+          else
+            ROLLBACK_SHA=$(git rev-list -n 1 "$PREV_TAG")
+            echo "Rolling back main to backup tag: ${PREV_TAG} (${ROLLBACK_SHA})"
+          fi
+
+          git config user.email "guard-bot@github.com"
+          git config user.name "Freelancer Guard Bot"
+
+          git push origin "${ROLLBACK_SHA}:refs/heads/main" --force
+          ROLLBACK_STATUS=$?
+
+          if [ $ROLLBACK_STATUS -eq 0 ]; then
+            echo "::notice::Rollback of main successful"
+          else
+            echo "::error::Rollback of main FAILED"
+          fi
+
+          if [ $ROLLBACK_STATUS -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Check for force push
+        if: github.event_name == 'push' && github.event.forced == true && github.ref != 'refs/heads/main'
+        env:
+          ACTOR: ${{ github.actor }}
+          REF_NAME: ${{ github.ref_name }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+        run: |
+          echo "::error::FORCE PUSH DETECTED on ${REF_NAME} by ${ACTOR}"
+          echo "Previous HEAD: ${BEFORE}"
+          echo "New HEAD: ${AFTER}"
+
+      - name: Check diff size
+        if: github.event_name == 'push'
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ "${BEFORE}" != "0000000000000000000000000000000000000000" ]; then
+            LINES=$(git diff --shortstat "${BEFORE}" "${GITHUB_SHA}" 2>/dev/null | grep -oP '\d+ insertion' | grep -oP '\d+' || echo 0)
+            if [ "${LINES:-0}" -gt 5000 ]; then
+              echo "::warning::Large diff detected: ${LINES} lines changed"
+            fi
+          fi
+
+      - name: Check commit count
+        if: github.event_name == 'push'
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ "${BEFORE}" != "0000000000000000000000000000000000000000" ]; then
+            COUNT=$(git rev-list --count "${BEFORE}".."${GITHUB_SHA}" 2>/dev/null || echo 0)
+            if [ "${COUNT:-0}" -gt 20 ]; then
+              echo "::warning::Mass commits detected: ${COUNT} commits in one push"
+            fi
+          fi
+
+      - name: Check large files
+        if: github.event_name == 'push'
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ "${BEFORE}" != "0000000000000000000000000000000000000000" ]; then
+            LARGE=$(git diff --name-only "${BEFORE}".."${GITHUB_SHA}" 2>/dev/null | while read f; do
+              if [ -f "$f" ]; then
+                SIZE=$(stat -c%s "$f" 2>/dev/null || echo 0)
+                if [ "$SIZE" -gt 52428800 ]; then
+                  echo "$f ($SIZE bytes)"
+                fi
+              fi
+            done)
+            if [ -n "$LARGE" ]; then
+              echo "::error::Large files (>50MB) detected: $LARGE"
+              exit 1
+            fi
+          fi
+
+      - name: Scan for obfuscation
+        if: github.event_name == 'push'
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ "${BEFORE}" != "0000000000000000000000000000000000000000" ]; then
+            DIFF=$(git diff "${BEFORE}".."${GITHUB_SHA}" -- '*.php' '*.js' '*.py' 2>/dev/null || true)
+            if echo "$DIFF" | grep -qE '(eval\s*\(\s*base64_decode|eval\s*\(\s*atob|eval\s*\(\s*gzinflate|preg_replace\s*\(.*/e|\\x[0-9a-f]{2}.*\\x[0-9a-f]{2}.*\\x[0-9a-f]{2})'; then
+              echo "::error::OBFUSCATED CODE PATTERN DETECTED in push"
+              exit 1
+            fi
+          fi
+
+  merge:
+    needs: checks
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create or update PR and merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+          REPO: ${{ github.repository }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          EXISTING_PR=$(gh pr list --base main --head dev --json number --jq '.[0].number' 2>/dev/null || echo "")
+
+          if [ -z "$EXISTING_PR" ]; then
+            COMMIT_LIST=""
+            if [ "${BEFORE}" != "0000000000000000000000000000000000000000" ]; then
+              COMMIT_LIST=$(git log --oneline "${BEFORE}".."${GITHUB_SHA}" 2>/dev/null | head -20 | sed 's/^/- /' || echo "")
+            fi
+            [ -z "$COMMIT_LIST" ] && COMMIT_LIST="- ${GITHUB_SHA::7}"
+
+            PR_URL=$(gh pr create \
+              --base main \
+              --head dev \
+              --title "Changes from developer" \
+              --body "Auto PR from dev push by ${ACTOR}" 2>&1)
+
+            PR_NUMBER=$(echo "$PR_URL" | grep -oP '\d+$' || echo "")
+          else
+            PR_NUMBER="$EXISTING_PR"
+          fi
+
+          # === CONTENT VALIDATION ===
+          echo "Scanning PR content..."
+          BLOCK_MERGE=false
+          BLOCK_REASONS=""
+
+          PR_URL_FOR_SCAN=""
+          if [ -n "$PR_NUMBER" ]; then
+            PR_URL_FOR_SCAN="$PR_NUMBER"
+          fi
+
+          if [ -n "$PR_URL_FOR_SCAN" ]; then
+            # Get changed files
+            CHANGED_FILES=$(gh pr view "$PR_URL_FOR_SCAN" --json files --jq '.files[].path' 2>/dev/null || echo "")
+
+            # Check 1: Dangerous file extensions
+            DANGEROUS=$(echo "$CHANGED_FILES" | grep -iE '\.(exe|bat|cmd|ps1|dll|so|bin|msi|scr|com|vbs|wsf|jar)$' || true)
+            if [ -n "$DANGEROUS" ]; then
+              BLOCK_MERGE=true
+              BLOCK_REASONS="${BLOCK_REASONS}\n❌ Опасные файлы: $DANGEROUS"
+            fi
+
+            # Check 2: Suspicious code patterns in diff
+            DIFF=$(gh pr diff "$PR_URL_FOR_SCAN" 2>/dev/null || echo "")
+
+            # Obfuscation / injection patterns
+            SUSPICIOUS=$(echo "$DIFF" | grep -iE '(eval\s*\(|exec\s*\(|base64_decode|atob\s*\(|Buffer\.from|child_process|subprocess\.(call|run|Popen)|os\.system|__import__|require\s*\(\s*["\x27]child_process|\\x[0-9a-f]{2}|\\u[0-9a-f]{4})' || true)
+            if [ -n "$SUSPICIOUS" ]; then
+              BLOCK_MERGE=true
+              BLOCK_REASONS="${BLOCK_REASONS}\n❌ Подозрительный код: $(echo "$SUSPICIOUS" | head -3)"
+            fi
+
+            # Check 3: External URLs / hardcoded IPs (potential C2)
+            EXTERNAL=$(echo "$DIFF" | grep -oE 'https?://[a-zA-Z0-9._/-]+' | grep -ivE '(github\.com|githubusercontent\.com|api\.telegram\.org|yandexcloud\.net|b244\.ru)' | head -5 || true)
+            if [ -n "$EXTERNAL" ]; then
+              BLOCK_MERGE=true
+              BLOCK_REASONS="${BLOCK_REASONS}\n⚠️ Внешние URL: $(echo "$EXTERNAL" | tr '\n' ' ')"
+            fi
+
+            # Check 4: Large binary files added
+            LARGE=$(echo "$DIFF" | grep -E '^\+.*Binary file' || true)
+            if [ -n "$LARGE" ]; then
+              BLOCK_MERGE=true
+              BLOCK_REASONS="${BLOCK_REASONS}\n❌ Бинарные файлы добавлены"
+            fi
+
+            # If blocked — alert and skip merge
+            if [ "$BLOCK_MERGE" = "true" ]; then
+              echo "::error::Content validation FAILED"
+              echo -e "$BLOCK_REASONS"
+              if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+                ALERT_TEXT=$(printf "🚨 ЗАБЛОКИРОВАНО в %s\n\nPR: %s\nВетка: %s\n%b\n\nPR НЕ вмержен. Требуется проверка." "$REPO" "$PR_URL_FOR_SCAN" "$GITHUB_REF_NAME" "$BLOCK_REASONS")
+                curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+                  --data-urlencode "chat_id=${TG_CHAT_ID}" \
+                  --data-urlencode "text=${ALERT_TEXT}" \
+                  -d "disable_web_page_preview=true" || true
+              fi
+              exit 0
+            fi
+
+            echo "✅ Content validation passed"
+          fi
+          # === END CONTENT VALIDATION ===
+
+          MERGE_SUCCESS=false
+          if [ -n "$PR_NUMBER" ]; then
+            sleep 5
+            if gh pr merge "$PR_NUMBER" --merge --delete-branch=false 2>&1; then
+              MERGE_SUCCESS=true
+            else
+              echo "::error::Merge failed for PR #${PR_NUMBER}"
+            fi
+          fi
+
+          if [ "$MERGE_SUCCESS" = "true" ] && [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+              -H "Content-Type: application/json" \
+              -d "{
+                \"chat_id\": \"${TG_CHAT_ID}\",
+                \"text\": \"OK: Code accepted in ${REPO}\",
+                \"reply_markup\": {\"inline_keyboard\": [[{\"text\": \"OK\", \"callback_data\": \"delete_msg\"}]]}
+              }" || true
+          fi
+
+      - name: Comment on PR if merge failed
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          PR_NUMBER=$(gh pr list --head "${REF_NAME}" --json number --jq '.[0].number' 2>/dev/null || echo "")
+          if [ -n "$PR_NUMBER" ]; then
+            gh pr comment "$PR_NUMBER" --body "Checks failed. Fix errors and push again. See Actions logs."
+          fi
+
+  notify-delete:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'delete'
+    steps:
+      - name: Alert on branch/tag deletion
+        env:
+          ACTOR: ${{ github.actor }}
+          REF_TYPE: ${{ github.event.ref_type }}
+          REF: ${{ github.event.ref }}
+        run: |
+          echo "::warning::${REF_TYPE} '${REF}' was deleted by ${ACTOR}"
