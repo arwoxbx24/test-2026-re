@@ -217,13 +217,15 @@ jobs:
         env:
           TG_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT: ${{ secrets.TG_CHAT_ID }}
+          REPO: ${{ github.repository }}
+          REPLY_MARKUP: '{"inline_keyboard":[[{"text":"OK \u2713","callback_data":"ok_delete"}]]}'
         run: |
-          MSG="🚨 SECURITY BLOCK in ${{ github.repository }}%0A%0ABranch: ${GITHUB_REF#refs/heads/}%0AReason: ${BLOCK_REASON}%0ACommit: ${GITHUB_SHA:0:7}%0AAction: Rolled back"
+          MSG="🚨 SECURITY BLOCK in ${REPO}%0A%0ABranch: ${GITHUB_REF#refs/heads/}%0AReason: ${BLOCK_REASON}%0ACommit: ${GITHUB_SHA:0:7}%0AAction: Rolled back"
           curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
             -d "chat_id=${TG_CHAT}" \
             -d "text=${MSG}" \
             -d "parse_mode=HTML" \
-            --data-urlencode 'reply_markup={"inline_keyboard":[[{"text":"OK ✓","callback_data":"ok_delete"}]]}' || true
+            --data-urlencode "reply_markup=${REPLY_MARKUP}" || true
 
       - name: Fail on security violation
         if: env.BLOCK_PUSH == 'true'
@@ -252,6 +254,7 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           REPO: ${{ github.repository }}
+          REPLY_MARKUP: '{"inline_keyboard":[[{"text":"OK \u2713","callback_data":"ok_delete"}]]}'
         run: |
           if [ "${BEFORE}" = "0000000000000000000000000000000000000000" ]; then
             echo "First push - skipping LLM review"
@@ -330,7 +333,7 @@ jobs:
                 --data-urlencode "chat_id=${TG_CHAT_ID}" \
                 --data-urlencode "text=LLM BLOCKED merge in ${REPO}: ${LLM_REASON}" \
                 -d "disable_web_page_preview=true" \
-                --data-urlencode 'reply_markup={"inline_keyboard":[[{"text":"OK ✓","callback_data":"ok_delete"}]]}' || true
+                --data-urlencode "reply_markup=${REPLY_MARKUP}" || true
             fi
             exit 1
           else
@@ -379,6 +382,7 @@ jobs:
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
           TIMEWEB_AI_KEY: ${{ secrets.TIMEWEB_AI_KEY }}
           BEFORE: ${{ github.event.before }}
+          REPLY_MARKUP: '{"inline_keyboard":[[{"text":"OK \u2713","callback_data":"ok_delete"}]]}'
         run: |
           EXISTING_PR=$(gh pr list --base main --head dev --json number --jq '.[0].number' 2>/dev/null || echo "")
 
@@ -454,7 +458,7 @@ jobs:
                   --data-urlencode "chat_id=${TG_CHAT_ID}" \
                   --data-urlencode "text=${ALERT_TEXT}" \
                   -d "disable_web_page_preview=true" \
-                  --data-urlencode "reply_markup={\"inline_keyboard\":[[{\"text\":\"OK ✓\",\"callback_data\":\"ok_delete\"}]]}" || true
+                  --data-urlencode "reply_markup=${REPLY_MARKUP}" || true
               fi
               exit 1
             fi
@@ -543,7 +547,7 @@ jobs:
                   --data-urlencode "chat_id=${TG_CHAT_ID}" \
                   --data-urlencode "text=${TG_MSG}" \
                   -d "disable_web_page_preview=true" \
-                  --data-urlencode 'reply_markup={"inline_keyboard":[[{"text":"OK ✓","callback_data":"ok_delete"}]]}' || true
+                  --data-urlencode "reply_markup=${REPLY_MARKUP}" || true
               fi
             else
               echo "LLM summary unavailable (both APIs failed)"
