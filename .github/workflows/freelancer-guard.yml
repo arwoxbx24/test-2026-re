@@ -144,7 +144,7 @@ jobs:
           fi
 
       - name: Check dangerous file extensions
-        if: github.event_name == 'push' && env.BEFORE != '0000000000000000000000000000000000000000'
+        if: always() && github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000'
         env:
           BEFORE: ${{ github.event.before }}
         run: |
@@ -193,7 +193,7 @@ jobs:
           fi
 
       - name: Verify guard file integrity
-        if: github.event_name == 'push'
+        if: always() && github.event_name == 'push'
         run: |
           if [ ! -f ".github/workflows/freelancer-guard.yml" ]; then
             echo "::error::Guard workflow file deleted! This is a security violation."
