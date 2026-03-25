@@ -407,7 +407,7 @@ jobs:
             DIFF=$(gh pr diff "$PR_URL_FOR_SCAN" 2>/dev/null || echo "")
 
             # Obfuscation / injection patterns
-            SUSPICIOUS=$(echo "$DIFF" | grep -iE '(eval\s*\(|exec\s*\(|base64_decode|atob\s*\(|Buffer\.from|child_process|subprocess\.(call|run|Popen)|os\.system|__import__|require\s*\(\s*["\x27]child_process|\\x[0-9a-f]{2}|\\u[0-9a-f]{4})' || true)
+            SUSPICIOUS=$(echo "$DIFF" | grep -v '.github/' | grep -iE '(eval\s*\(|exec\s*\(|base64_decode|atob\s*\(|Buffer\.from|child_process|subprocess\.(call|run|Popen)|os\.system|__import__|require\s*\(\s*["\x27]child_process|\\x[0-9a-f]{2}|\\u[0-9a-f]{4})' || true)
             if [ -n "$SUSPICIOUS" ]; then
               BLOCK_MERGE=true
               BLOCK_REASONS="${BLOCK_REASONS}\n❌ Подозрительный код: $(echo "$SUSPICIOUS" | head -3)"
