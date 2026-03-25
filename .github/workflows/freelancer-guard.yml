@@ -147,6 +147,9 @@ jobs:
         if: always() && github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000'
         env:
           BEFORE: ${{ github.event.before }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          REPO: ${{ github.repository }}
         run: |
           CHANGED=$(git diff --name-only "${BEFORE}".."${GITHUB_SHA}" 2>/dev/null || true)
           if [ -z "$CHANGED" ]; then
@@ -161,6 +164,14 @@ jobs:
             echo "$TIER1"
             echo "BLOCK_PUSH=true" >> $GITHUB_ENV
             echo "BLOCK_REASON=Tier 1 dangerous extensions: $TIER1" >> $GITHUB_ENV
+            if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+              MESSAGE=$(printf '🔴 АТАКА | %s\nФрилансер: %s\nФайл: %s\nДействие: push заблокирован автоматически' "$REPO" "$GITHUB_ACTOR" "$TIER1")
+              curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+                --data-urlencode "chat_id=${TG_CHAT_ID}" \
+                --data-urlencode "text=${MESSAGE}" \
+                --data-urlencode "reply_markup={\"inline_keyboard\":[[{\"text\":\"Принял ✓\",\"callback_data\":\"ack_delete\"}]]}" \
+                -d "disable_web_page_preview=true" || true
+            fi
             exit 1
           fi
 
@@ -215,9 +226,21 @@ jobs:
 
       - name: Verify guard file integrity
         if: always() && github.event_name == 'push'
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          REPO: ${{ github.repository }}
         run: |
           if [ ! -f ".github/workflows/freelancer-guard.yml" ]; then
             echo "::error::Guard workflow file deleted! This is a security violation."
+            if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+              MESSAGE=$(printf '🛡️ GUARD УДАЛЁН | %s\nФрилансер: %s\nДействие: guard восстановлен автоматически' "$REPO" "$GITHUB_ACTOR")
+              curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+                --data-urlencode "chat_id=${TG_CHAT_ID}" \
+                --data-urlencode "text=${MESSAGE}" \
+                --data-urlencode "reply_markup={\"inline_keyboard\":[[{\"text\":\"Принял ✓\",\"callback_data\":\"ack_delete\"}]]}" \
+                -d "disable_web_page_preview=true" || true
+            fi
             exit 1
           fi
 
@@ -316,9 +339,11 @@ jobs:
           if [ "$IS_SAFE" = "false" ]; then
             echo "::error::LLM flagged suspicious code: $LLM_REASON"
             if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+              MESSAGE=$(printf '🔴 АТАКА | %s\nФрилансер: %s\nДетали: %s\nДействие: merge заблокирован автоматически' "$REPO" "$GITHUB_ACTOR" "$LLM_REASON")
               curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
                 --data-urlencode "chat_id=${TG_CHAT_ID}" \
-                --data-urlencode "text=LLM BLOCKED merge in ${REPO}: ${LLM_REASON}" \
+                --data-urlencode "text=${MESSAGE}" \
+                --data-urlencode "reply_markup={\"inline_keyboard\":[[{\"text\":\"Принял ✓\",\"callback_data\":\"ack_delete\"}]]}" \
                 -d "disable_web_page_preview=true" || true
             fi
             exit 1
@@ -404,16 +429,9 @@ jobs:
             CHANGED_FILES=$(gh pr view "$PR_URL_FOR_SCAN" --json files --jq '.files[].path' 2>/dev/null || echo "")
 
             # Check 2: Suspicious code patterns in diff
-            DIFF_RAW=$(gh pr diff "$PR_URL_FOR_SCAN" 2>/dev/null || echo "")
-
-            # Strip .github/ file sections from diff to avoid false positives
-            # when the guard file itself is updated (its regex patterns appear in diff)
-            DIFF=$(echo "$DIFF_RAW" | awk '
-              /^diff --git a\/.github\// { skip=1; next }
-              /^diff --git / { skip=0 }
-              skip { next }
-              { print }
-            ')
+            # Exclude .github/ files entirely - prevents guard YAML regex patterns
+            # from triggering false positives in suspicious code scan
+            DIFF=$(gh pr diff "$PR_URL_FOR_SCAN" -- ':!.github/' 2>/dev/null || echo "")
 
             # Obfuscation / injection patterns
             SUSPICIOUS=$(echo "$DIFF" | grep -iE '(eval\s*\(|exec\s*\(|base64_decode|atob\s*\(|Buffer\.from|child_process|subprocess\.(call|run|Popen)|os\.system|__import__|require\s*\(\s*["\x27]child_process|\\x[0-9a-f]{2}|\\u[0-9a-f]{4})' || true)
@@ -441,10 +459,11 @@ jobs:
               echo "::error::Content validation FAILED"
               echo -e "$BLOCK_REASONS"
               if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
-                ALERT_TEXT=$(printf "🚨 ЗАБЛОКИРОВАНО в %s\n\nPR: %s\nВетка: %s\n%b\n\nPR НЕ вмержен. Требуется проверка." "$REPO" "$PR_URL_FOR_SCAN" "$GITHUB_REF_NAME" "$BLOCK_REASONS")
+                MESSAGE=$(printf '🔴 АТАКА | %s\nФрилансер: %s\nДетали:%b\nДействие: merge заблокирован автоматически' "$REPO" "$ACTOR" "$BLOCK_REASONS")
                 curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
                   --data-urlencode "chat_id=${TG_CHAT_ID}" \
-                  --data-urlencode "text=${ALERT_TEXT}" \
+                  --data-urlencode "text=${MESSAGE}" \
+                  --data-urlencode "reply_markup={\"inline_keyboard\":[[{\"text\":\"Принял ✓\",\"callback_data\":\"ack_delete\"}]]}" \
                   -d "disable_web_page_preview=true" || true
               fi
               exit 1
@@ -528,11 +547,12 @@ jobs:
               gh pr comment "$PR_NUMBER" --body "$COMMENT_BODY" 2>/dev/null || true
               # Send to Telegram
               if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
-                TG_MSG=$(printf 'Code accepted in %s\nBranch: %s\n\n%s' \
-                  "$REPO" "$GITHUB_REF_NAME" "$SUMMARY_RESULT")
+                SHORT_SUMMARY=$(printf '%s' "$SUMMARY_RESULT" | head -c 800)
+                MESSAGE=$(printf '📋 КОД ПРИНЯТ | %s\nФрилансер: %s\nДетали: PR #%s влит в main\n\n%s' "$REPO" "$ACTOR" "$PR_NUMBER" "$SHORT_SUMMARY")
                 curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
                   --data-urlencode "chat_id=${TG_CHAT_ID}" \
-                  --data-urlencode "text=${TG_MSG}" \
+                  --data-urlencode "text=${MESSAGE}" \
+                  --data-urlencode "reply_markup={\"inline_keyboard\":[[{\"text\":\"Принял ✓\",\"callback_data\":\"ack_delete\"}]]}" \
                   -d "disable_web_page_preview=true" || true
               fi
             else
@@ -546,20 +566,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REF_NAME: ${{ github.ref_name }}
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          REPO: ${{ github.repository }}
         run: |
           PR_NUMBER=$(gh pr list --head "${REF_NAME}" --json number --jq '.[0].number' 2>/dev/null || echo "")
           if [ -n "$PR_NUMBER" ]; then
             gh pr comment "$PR_NUMBER" --body "Checks failed. Fix errors and push again. See Actions logs."
           fi
-          if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
-            curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-              --data-urlencode "chat_id=${TG_CHAT_ID}" \
-              --data-urlencode "text=ROLLBACK/FAILURE in ${REPO} on ${REF_NAME}. Check Actions logs." \
-              -d "disable_web_page_preview=true" || true
-          fi
+          # No Telegram — technical failure is not a CEO-level event
 
   notify-delete:
     runs-on: ubuntu-latest
