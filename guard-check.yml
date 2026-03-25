@@ -1,0 +1,566 @@
+name: Freelancer Guard
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+    branches: ['main']
+  delete:
+
+permissions:
+  contents: write
+  pull-requests: write
+  workflows: write
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create backup tag
+        if: github.event_name == 'push'
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          BRANCH=$(echo "${REF_NAME}" | tr '/' '-')
+          TAG="backup/${BRANCH}/$(date -u +%Y%m%d-%H%M%S)-${GITHUB_SHA::7}"
+          git tag "$TAG"
+          git push origin "$TAG" 2>/dev/null || echo "Tag push failed (might already exist)"
+
+      - name: Rollback main branch push
+        if: |
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/main' &&
+          !contains(github.actor, 'github-actions')
+        env:
+          ACTOR: ${{ github.actor }}
+          BEFORE_SHA: ${{ github.event.before }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "::warning::Push to main detected by ${ACTOR} - initiating rollback"
+
+          PREV_TAG=$(git tag --sort=-creatordate | grep "^backup/main/" | grep -v "${GITHUB_SHA::7}" | head -1)
+
+          if [ -z "$PREV_TAG" ]; then
+            if [ "${BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]; then
+              ROLLBACK_SHA="${BEFORE_SHA}"
+              echo "No previous backup tag found, rolling back to before-SHA: ${ROLLBACK_SHA}"
+            else
+              echo "::error::Cannot rollback — no previous state found (first push to main)"
+              exit 0
+            fi
+          else
+            ROLLBACK_SHA=$(git rev-list -n 1 "$PREV_TAG")
+            echo "Rolling back main to backup tag: ${PREV_TAG} (${ROLLBACK_SHA})"
+          fi
+
+          git config user.email "guard-bot@github.com"
+          git config user.name "Freelancer Guard Bot"
+
+          git push origin "${ROLLBACK_SHA}:refs/heads/main" --force
+          ROLLBACK_STATUS=$?
+
+          if [ $ROLLBACK_STATUS -eq 0 ]; then
+            echo "::notice::Rollback of main successful"
+          else
+            echo "::error::Rollback of main FAILED"
+          fi
+
+          if [ $ROLLBACK_STATUS -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Check for force push
+        if: github.event_name == 'push' && github.event.forced == true && github.ref != 'refs/heads/main'
+        env:
+          ACTOR: ${{ github.actor }}
+          REF_NAME: ${{ github.ref_name }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.event.after }}
+        run: |
+          echo "::error::FORCE PUSH DETECTED on ${REF_NAME} by ${ACTOR}"
+          echo "Previous HEAD: ${BEFORE}"
+          echo "New HEAD: ${AFTER}"
+
+      - name: Check diff size
+        if: github.event_name == 'push'
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ "${BEFORE}" != "0000000000000000000000000000000000000000" ]; then
+            LINES=$(git diff --shortstat "${BEFORE}" "${GITHUB_SHA}" 2>/dev/null | grep -oP '\d+ insertion' | grep -oP '\d+' || echo 0)
+            if [ "${LINES:-0}" -gt 5000 ]; then
+              echo "::warning::Large diff detected: ${LINES} lines changed"
+            fi
+          fi
+
+      - name: Check commit count
+        if: github.event_name == 'push'
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ "${BEFORE}" != "0000000000000000000000000000000000000000" ]; then
+            COUNT=$(git rev-list --count "${BEFORE}".."${GITHUB_SHA}" 2>/dev/null || echo 0)
+            if [ "${COUNT:-0}" -gt 20 ]; then
+              echo "::warning::Mass commits detected: ${COUNT} commits in one push"
+            fi
+          fi
+
+      - name: Check large files
+        if: github.event_name == 'push'
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ "${BEFORE}" != "0000000000000000000000000000000000000000" ]; then
+            LARGE=$(git diff --name-only "${BEFORE}".."${GITHUB_SHA}" 2>/dev/null | while read f; do
+              if [ -f "$f" ]; then
+                SIZE=$(stat -c%s "$f" 2>/dev/null || echo 0)
+                if [ "$SIZE" -gt 52428800 ]; then
+                  echo "$f ($SIZE bytes)"
+                fi
+              fi
+            done)
+            if [ -n "$LARGE" ]; then
+              echo "::error::Large files (>50MB) detected: $LARGE"
+              exit 1
+            fi
+          fi
+
+      - name: Scan for obfuscation
+        if: github.event_name == 'push'
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ "${BEFORE}" != "0000000000000000000000000000000000000000" ]; then
+            DIFF=$(git diff "${BEFORE}".."${GITHUB_SHA}" -- ':!.github/' 2>/dev/null || true)
+            if echo "$DIFF" | grep -v '\.github/' | grep -qE '(eval\s*\(\s*base64_decode|base64_decode\s*\(|eval\s*\(\s*atob|atob\s*\(|eval\s*\(\s*gzinflate|gzinflate\s*\(|child_process|subprocess|__import__|preg_replace\s*\(.*/e|\\x[0-9a-f]{2}.*\\x[0-9a-f]{2}.*\\x[0-9a-f]{2})'; then
+              echo "::error::OBFUSCATED CODE PATTERN DETECTED in push"
+              exit 1
+            fi
+          fi
+
+      - name: Check dangerous file extensions
+        if: always() && github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000'
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          CHANGED=$(git diff --name-only "${BEFORE}".."${GITHUB_SHA}" 2>/dev/null || true)
+          if [ -z "$CHANGED" ]; then
+            echo "No changed files detected"
+            exit 0
+          fi
+
+          # Tier 1: HARD BLOCK — never legitimate
+          TIER1=$(echo "$CHANGED" | grep -iE '\.(scr|com|vbs|wsf|msi)$' || true)
+          if [ -n "$TIER1" ]; then
+            echo "::error::BLOCKED: Dangerous file extensions (Tier 1 — always prohibited):"
+            echo "$TIER1"
+            echo "BLOCK_PUSH=true" >> $GITHUB_ENV
+            echo "BLOCK_REASON=Tier 1 dangerous extensions: $TIER1" >> $GITHUB_ENV
+            exit 1
+          fi
+
+          # Tier 2: SMART BLOCK — block outside safe paths
+          TIER2=$(echo "$CHANGED" | grep -iE '\.(exe|bat|cmd|ps1|dll|so|jar|bin)$' || true)
+          if [ -n "$TIER2" ]; then
+            UNSAFE=$(echo "$TIER2" | grep -vE '^(node_modules|vendor|lib|build|dist)/' || true)
+            if [ -n "$UNSAFE" ]; then
+              echo "::error::BLOCKED: Binary files outside safe paths (Tier 2):"
+              echo "$UNSAFE"
+              echo "BLOCK_PUSH=true" >> $GITHUB_ENV
+              echo "BLOCK_REASON=Tier 2 binaries outside safe paths: $UNSAFE" >> $GITHUB_ENV
+              exit 1
+            else
+              echo "::warning::Binary files in safe paths (allowed): $TIER2"
+            fi
+          fi
+
+          echo "Extension check passed"
+
+
+      - name: Check Tier 3 file extensions (audit)
+        if: always() && github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000'
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          CHANGED=$(git diff --name-only "${BEFORE}".."${GITHUB_SHA}" 2>/dev/null || true)
+          if [ -z "$CHANGED" ]; then
+            echo "No changed files detected"
+            exit 0
+          fi
+
+          # Tier 3: AUDIT - flag for review but do not block
+          TIER3=$(echo "$CHANGED" | grep -iE '\.(sh|py|rb|pl|lua|tcl|awk|sed|cgi|htaccess|htpasswd|env|pem|key|p12|pfx|cer|crt|ovpn|sql|db|sqlite|dump|bak|swp|orig)$' || true)
+          if [ -n "$TIER3" ]; then
+            echo "::warning::Tier 3 files (require review):"
+            echo "$TIER3"
+          else
+            echo "Tier 3 extension check: no flagged files"
+          fi
+
+      - name: Rollback dangerous push
+        if: failure() && github.event_name == 'push' && github.ref != 'refs/heads/main'
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ "${BEFORE}" != "0000000000000000000000000000000000000000" ]; then
+            echo "Rolling back dangerous commit on ${GITHUB_REF}..."
+            git push --force origin "${BEFORE}:${GITHUB_REF}" || echo "::warning::Rollback failed"
+            echo "Commit rolled back to ${BEFORE}"
+          fi
+
+      - name: Verify guard file integrity
+        if: always() && github.event_name == 'push'
+        run: |
+          if [ ! -f ".github/workflows/freelancer-guard.yml" ]; then
+            echo "::error::Guard workflow file deleted! This is a security violation."
+            exit 1
+          fi
+
+  merge:
+    needs: checks
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: LLM code review
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          TIMEWEB_AI_KEY: ${{ secrets.TIMEWEB_AI_KEY }}
+          BEFORE: ${{ github.event.before }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          REPO: ${{ github.repository }}
+        run: |
+          if [ "${BEFORE}" = "0000000000000000000000000000000000000000" ]; then
+            echo "First push - skipping LLM review"
+            exit 0
+          fi
+
+          DIFF_TEXT=$(git diff "${BEFORE}".."${GITHUB_SHA}" -- '*.php' '*.js' '*.py' '*.sh' '*.ts' 2>/dev/null | head -c 12000 || true)
+
+          if [ -z "$DIFF_TEXT" ]; then
+            echo "No code diff - skipping LLM review"
+            exit 0
+          fi
+
+          echo "Running LLM code review..."
+
+          SECURITY_PROMPT="You are a security code reviewer. Analyze this git diff for a freelancer project. Check for: 1) backdoors 2) data exfiltration 3) obfuscated malicious code 4) time bombs 5) unauthorized network calls 6) credential theft. Respond ONLY with JSON: {\"safe\": true} or {\"safe\": false, \"reason\": \"brief explanation in Russian\"}."
+
+          # Build request body - diff passed via jq --arg which handles all JSON escaping
+          LLM_BODY=$(jq -n \
+            --arg prompt "$SECURITY_PROMPT" \
+            --arg diff "$DIFF_TEXT" \
+            '{
+              "model": "llama-3.3-70b-versatile",
+              "messages": [{"role": "user", "content": ($prompt + "\n\nDiff:\n" + $diff)}],
+              "temperature": 0,
+              "max_tokens": 200,
+              "response_format": {"type": "json_object"}
+            }')
+
+          LLM_RESULT=""
+
+          # Try Groq (free, fast)
+          if [ -n "$GROQ_API_KEY" ]; then
+            LLM_RESULT=$(curl -s --max-time 30 \
+              -H "Authorization: Bearer ${GROQ_API_KEY}" \
+              -H "Content-Type: application/json" \
+              -d "$LLM_BODY" \
+              "https://api.groq.com/openai/v1/chat/completions" 2>/dev/null \
+              | jq -r '.choices[0].message.content // empty' 2>/dev/null || echo "")
+            echo "Groq response: $LLM_RESULT"
+          fi
+
+          # Fallback: Timeweb AI
+          if [ -z "$LLM_RESULT" ] && [ -n "$TIMEWEB_AI_KEY" ]; then
+            echo "Groq unavailable, trying Timeweb AI..."
+            TW_BODY=$(jq -n \
+              --arg prompt "$SECURITY_PROMPT" \
+              --arg diff "$DIFF_TEXT" \
+              '{
+                "model": "deepseek-chat",
+                "messages": [{"role": "user", "content": ($prompt + "\n\nDiff:\n" + $diff)}],
+                "temperature": 0,
+                "max_tokens": 200
+              }')
+            LLM_RESULT=$(curl -s --max-time 30 \
+              -H "Authorization: Bearer ${TIMEWEB_AI_KEY}" \
+              -H "Content-Type: application/json" \
+              -d "$TW_BODY" \
+              "https://api.timeweb.cloud/v2/openai/chat/completions" 2>/dev/null \
+              | jq -r '.choices[0].message.content // empty' 2>/dev/null || echo "")
+            echo "Timeweb AI response: $LLM_RESULT"
+          fi
+
+          if [ -z "$LLM_RESULT" ]; then
+            echo "::warning::LLM review unavailable, relying on pattern checks only"
+            exit 0
+          fi
+
+          IS_SAFE=$(echo "$LLM_RESULT" | jq -r '.safe // empty' 2>/dev/null || echo "")
+          LLM_REASON=$(echo "$LLM_RESULT" | jq -r '.reason // empty' 2>/dev/null || echo "")
+
+          if [ "$IS_SAFE" = "false" ]; then
+            echo "::error::LLM flagged suspicious code: $LLM_REASON"
+            if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+              curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+                --data-urlencode "chat_id=${TG_CHAT_ID}" \
+                --data-urlencode "text=LLM BLOCKED merge in ${REPO}: ${LLM_REASON}" \
+                -d "disable_web_page_preview=true" || true
+            fi
+            exit 1
+          else
+            echo "LLM review: safe"
+          fi
+
+      - name: Sync guard to feature branches
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.email "guard-bot@github.com"
+          git config user.name "Freelancer Guard Bot"
+
+          GUARD_FILE=".github/workflows/freelancer-guard.yml"
+
+          # Get list of remote branches except main and dev
+          BRANCHES=$(git branch -r | grep -v 'HEAD\|origin/main\|origin/dev' | sed 's|origin/||' | tr -d ' ')
+
+          for BRANCH in $BRANCHES; do
+            echo "Syncing guard to branch: $BRANCH"
+            git fetch origin "$BRANCH" 2>/dev/null || continue
+            git checkout "$BRANCH" 2>/dev/null || continue
+
+            # Copy guard file from main
+            git checkout main -- "$GUARD_FILE" 2>/dev/null || continue
+
+            if git diff --cached --quiet; then
+              echo "Guard already up to date on $BRANCH"
+            else
+              git commit -m "chore: sync freelancer-guard from main [skip ci]"
+              git push origin "$BRANCH" 2>/dev/null || echo "Push to $BRANCH failed, skipping"
+            fi
+
+            git checkout dev
+          done
+
+          echo "Guard sync complete"
+
+      - name: Create or update PR and merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+          REPO: ${{ github.repository }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          TIMEWEB_AI_KEY: ${{ secrets.TIMEWEB_AI_KEY }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          EXISTING_PR=$(gh pr list --base main --head dev --json number --jq '.[0].number' 2>/dev/null || echo "")
+
+          if [ -z "$EXISTING_PR" ]; then
+            COMMIT_LIST=""
+            if [ "${BEFORE}" != "0000000000000000000000000000000000000000" ]; then
+              COMMIT_LIST=$(git log --oneline "${BEFORE}".."${GITHUB_SHA}" 2>/dev/null | head -20 | sed 's/^/- /' || echo "")
+            fi
+            [ -z "$COMMIT_LIST" ] && COMMIT_LIST="- ${GITHUB_SHA::7}"
+
+            PR_URL=$(gh pr create \
+              --base main \
+              --head dev \
+              --title "Changes from developer" \
+              --body "Auto PR from dev push by ${ACTOR}" 2>&1)
+
+            PR_NUMBER=$(echo "$PR_URL" | grep -oP '\d+$' || echo "")
+          else
+            PR_NUMBER="$EXISTING_PR"
+          fi
+
+          # === CONTENT VALIDATION ===
+          echo "Scanning PR content..."
+          BLOCK_MERGE=false
+          BLOCK_REASONS=""
+
+          PR_URL_FOR_SCAN=""
+          if [ -n "$PR_NUMBER" ]; then
+            PR_URL_FOR_SCAN="$PR_NUMBER"
+          fi
+
+          if [ -n "$PR_URL_FOR_SCAN" ]; then
+            # Get changed files
+            CHANGED_FILES=$(gh pr view "$PR_URL_FOR_SCAN" --json files --jq '.files[].path' 2>/dev/null || echo "")
+
+            # Check 2: Suspicious code patterns in diff
+            DIFF=$(gh pr diff "$PR_URL_FOR_SCAN" 2>/dev/null || echo "")
+
+            # Obfuscation / injection patterns
+            SUSPICIOUS=$(echo "$DIFF" | grep -v '.github/' | grep -iE '(eval\s*\(|exec\s*\(|base64_decode|atob\s*\(|Buffer\.from|child_process|subprocess\.(call|run|Popen)|os\.system|__import__|require\s*\(\s*["\x27]child_process|\\x[0-9a-f]{2}|\\u[0-9a-f]{4})' || true)
+            if [ -n "$SUSPICIOUS" ]; then
+              BLOCK_MERGE=true
+              BLOCK_REASONS="${BLOCK_REASONS}\n❌ Подозрительный код: $(echo "$SUSPICIOUS" | head -3)"
+            fi
+
+            # Check 3: External URLs / hardcoded IPs (potential C2)
+            EXTERNAL=$(echo "$DIFF" | grep -oE 'https?://[a-zA-Z0-9._/-]+' | grep -ivE '(github\.com|githubusercontent\.com|api\.telegram\.org|yandexcloud\.net|b244\.ru|git-scm\.com|python\.org|nodejs\.org|npmjs\.com|pypi\.org|packagist\.org|registry\.npmjs\.org|cdn\.jsdelivr\.net|api\.groq\.com|timeweb\.cloud|cloudflare\.com|docker\.com|hub\.docker\.com|releases\.hashicorp\.com|dl\.k8s\.io|storage\.googleapis\.com)' | head -5 || true)
+            if [ -n "$EXTERNAL" ]; then
+              BLOCK_MERGE=true
+              BLOCK_REASONS="${BLOCK_REASONS}\n⚠️ Внешние URL: $(echo "$EXTERNAL" | tr '\n' ' ')"
+            fi
+
+            # Check 4: Large binary files added
+            LARGE=$(echo "$DIFF" | grep -E '^\+.*Binary file' || true)
+            if [ -n "$LARGE" ]; then
+              BLOCK_MERGE=true
+              BLOCK_REASONS="${BLOCK_REASONS}\n❌ Бинарные файлы добавлены"
+            fi
+
+            # If blocked — alert and skip merge
+            if [ "$BLOCK_MERGE" = "true" ]; then
+              echo "::error::Content validation FAILED"
+              echo -e "$BLOCK_REASONS"
+              if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+                ALERT_TEXT=$(printf "🚨 ЗАБЛОКИРОВАНО в %s\n\nPR: %s\nВетка: %s\n%b\n\nPR НЕ вмержен. Требуется проверка." "$REPO" "$PR_URL_FOR_SCAN" "$GITHUB_REF_NAME" "$BLOCK_REASONS")
+                curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+                  --data-urlencode "chat_id=${TG_CHAT_ID}" \
+                  --data-urlencode "text=${ALERT_TEXT}" \
+                  -d "disable_web_page_preview=true" || true
+              fi
+              exit 1
+            fi
+
+            echo "✅ Content validation passed"
+          fi
+          # === END CONTENT VALIDATION ===
+
+          MERGE_SUCCESS=false
+          if [ -n "$PR_NUMBER" ]; then
+            sleep 5
+            if gh pr merge "$PR_NUMBER" --merge --delete-branch=false 2>&1; then
+              MERGE_SUCCESS=true
+            else
+              echo "::error::Merge failed for PR #${PR_NUMBER}"
+            fi
+          fi
+
+          if [ "$MERGE_SUCCESS" != "true" ]; then
+            exit 0
+          fi
+
+          # === BILINGUAL LLM SUMMARY ===
+          echo "Generating bilingual commit summary..."
+
+          MERGE_DIFF=$(gh pr diff "$PR_NUMBER" 2>/dev/null | head -c 8000 || echo "")
+          PR_TITLE=$(gh pr view "$PR_NUMBER" --json title --jq '.title' 2>/dev/null || echo "")
+          CHANGED_FILES_LIST=$(gh pr view "$PR_NUMBER" --json files --jq '[.files[].path] | join(", ")' 2>/dev/null || echo "")
+
+          if [ -n "$MERGE_DIFF" ] && [ -n "$PR_NUMBER" ]; then
+            SUMMARY_PROMPT="You are a tech lead assistant. Write a short bilingual summary of this code change. Format exactly: RU: / Что сделано: / - item / Внимание: (only if issues) / EN: / Changes: / - item / Notes: (only if issues)"
+
+            # All dynamic data via jq --arg - proper JSON escaping guaranteed
+            SUMMARY_BODY=$(jq -n \
+              --arg prompt "$SUMMARY_PROMPT" \
+              --arg title "$PR_TITLE" \
+              --arg files "$CHANGED_FILES_LIST" \
+              --arg diff "$MERGE_DIFF" \
+              '{
+                "model": "llama-3.3-70b-versatile",
+                "messages": [{"role": "user", "content": ($prompt + "\n\nPR: " + $title + "\nFiles: " + $files + "\n\nDiff:\n" + $diff)}],
+                "temperature": 0.3,
+                "max_tokens": 500
+              }')
+
+            SUMMARY_RESULT=""
+
+            if [ -n "$GROQ_API_KEY" ]; then
+              SUMMARY_RESULT=$(curl -s --max-time 30 \
+                -H "Authorization: Bearer ${GROQ_API_KEY}" \
+                -H "Content-Type: application/json" \
+                -d "$SUMMARY_BODY" \
+                "https://api.groq.com/openai/v1/chat/completions" 2>/dev/null \
+                | jq -r '.choices[0].message.content // empty' 2>/dev/null || echo "")
+            fi
+
+            if [ -z "$SUMMARY_RESULT" ] && [ -n "$TIMEWEB_AI_KEY" ]; then
+              TW_SUMMARY=$(jq -n \
+                --arg prompt "$SUMMARY_PROMPT" \
+                --arg title "$PR_TITLE" \
+                --arg files "$CHANGED_FILES_LIST" \
+                --arg diff "$MERGE_DIFF" \
+                '{
+                  "model": "deepseek-chat",
+                  "messages": [{"role": "user", "content": ($prompt + "\n\nPR: " + $title + "\nFiles: " + $files + "\n\nDiff:\n" + $diff)}],
+                  "temperature": 0.3,
+                  "max_tokens": 500
+                }')
+              SUMMARY_RESULT=$(curl -s --max-time 30 \
+                -H "Authorization: Bearer ${TIMEWEB_AI_KEY}" \
+                -H "Content-Type: application/json" \
+                -d "$TW_SUMMARY" \
+                "https://api.timeweb.cloud/v2/openai/chat/completions" 2>/dev/null \
+                | jq -r '.choices[0].message.content // empty' 2>/dev/null || echo "")
+            fi
+
+            if [ -n "$SUMMARY_RESULT" ]; then
+              # Post bilingual summary as PR comment
+              COMMENT_BODY=$(printf '## AI Code Review Summary\n\n%s\n\n---\n*Generated by Groq llama-3.3-70b / Timeweb deepseek-chat*' "$SUMMARY_RESULT")
+              gh pr comment "$PR_NUMBER" --body "$COMMENT_BODY" 2>/dev/null || true
+              # Send to Telegram
+              if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+                TG_MSG=$(printf 'Code accepted in %s\nBranch: %s\n\n%s' \
+                  "$REPO" "$GITHUB_REF_NAME" "$SUMMARY_RESULT")
+                curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+                  --data-urlencode "chat_id=${TG_CHAT_ID}" \
+                  --data-urlencode "text=${TG_MSG}" \
+                  -d "disable_web_page_preview=true" || true
+              fi
+            else
+              echo "LLM summary unavailable (both APIs failed)"
+            fi
+          fi
+          # === END BILINGUAL LLM SUMMARY ===
+
+      - name: Comment on PR if merge failed
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REF_NAME: ${{ github.ref_name }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          REPO: ${{ github.repository }}
+        run: |
+          PR_NUMBER=$(gh pr list --head "${REF_NAME}" --json number --jq '.[0].number' 2>/dev/null || echo "")
+          if [ -n "$PR_NUMBER" ]; then
+            gh pr comment "$PR_NUMBER" --body "Checks failed. Fix errors and push again. See Actions logs."
+          fi
+          if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+            curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${TG_CHAT_ID}" \
+              --data-urlencode "text=ROLLBACK/FAILURE in ${REPO} on ${REF_NAME}. Check Actions logs." \
+              -d "disable_web_page_preview=true" || true
+          fi
+
+  notify-delete:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'delete'
+    steps:
+      - name: Alert on branch/tag deletion
+        env:
+          ACTOR: ${{ github.actor }}
+          REF_TYPE: ${{ github.event.ref_type }}
+          REF: ${{ github.event.ref }}
+        run: |
+          echo "::warning::${REF_TYPE} '${REF}' was deleted by ${ACTOR}"
