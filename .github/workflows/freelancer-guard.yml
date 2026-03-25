@@ -154,39 +154,33 @@ jobs:
             fi
           fi
 
-      - name: Check dangerous file extensions
-        if: github.event_name == 'push' && github.event.before != '0000000000000000000000000000000000000000'
-        continue-on-error: true
-        env:
-          BEFORE: ${{ github.event.before }}
+      - name: Check dangerous extensions
+        if: github.event_name == 'push'
         run: |
-          CHANGED=$(git diff --name-only "${BEFORE}".."${GITHUB_SHA}" 2>/dev/null || true)
-          if [ -z "$CHANGED" ]; then
-            echo "No changed files detected"
-            exit 0
-          fi
+          DANGEROUS_FILES=""
 
-          # Tier 1: HARD BLOCK — never legitimate
-          TIER1=$(echo "$CHANGED" | grep -iE '\.(scr|com|vbs|wsf|msi)$' || true)
-          if [ -n "$TIER1" ]; then
-            echo "::error::BLOCKED: Dangerous file extensions (Tier 1 — always prohibited):"
-            echo "$TIER1"
+          # Tier 1: HARD BLOCK — always blocked
+          TIER1=$(git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -iE '\.(scr|vbs|wsf|msi)$' || true)
+          # .com needs special handling (exclude domain names in URLs)
+          TIER1_COM=$(git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -iE '\.com$' || true)
+          if [ -n "$TIER1" ] || [ -n "$TIER1_COM" ]; then
+            echo "::error::TIER 1 BLOCKED: $TIER1 $TIER1_COM"
+            DANGEROUS_FILES="$TIER1 $TIER1_COM"
             echo "BLOCK_PUSH=true" >> $GITHUB_ENV
-            echo "BLOCK_REASON=Tier 1 dangerous extensions: $TIER1" >> $GITHUB_ENV
+            echo "BLOCK_REASON=Tier 1 dangerous extensions: $TIER1 $TIER1_COM" >> $GITHUB_ENV
           fi
 
-          # Tier 2: SMART BLOCK — block outside safe paths
-          TIER2=$(echo "$CHANGED" | grep -iE '\.(exe|bat|cmd|ps1|dll|so|jar|bin)$' || true)
+          # Tier 2: SMART BLOCK — block unless in safe path
+          TIER2=$(git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -iE '\.(exe|bat|cmd|ps1|dll|so|jar|bin)$' | grep -vE '^(node_modules|vendor|lib|build|dist)/' || true)
           if [ -n "$TIER2" ]; then
-            UNSAFE=$(echo "$TIER2" | grep -vE '^(node_modules|vendor|lib|build|dist)/' || true)
-            if [ -n "$UNSAFE" ]; then
-              echo "::error::BLOCKED: Binary files outside safe paths (Tier 2):"
-              echo "$UNSAFE"
-              echo "BLOCK_PUSH=true" >> $GITHUB_ENV
-              echo "BLOCK_REASON=Tier 2 binaries outside safe paths: $UNSAFE" >> $GITHUB_ENV
-            else
-              echo "::warning::Binary files in safe paths (allowed): $TIER2"
-            fi
+            echo "::error::TIER 2 BLOCKED: $TIER2"
+            DANGEROUS_FILES="$DANGEROUS_FILES $TIER2"
+            echo "BLOCK_PUSH=true" >> $GITHUB_ENV
+            echo "BLOCK_REASON=Tier 2 binaries outside safe paths: $TIER2" >> $GITHUB_ENV
+          fi
+
+          if [ -n "$(echo $DANGEROUS_FILES | tr -d ' ')" ]; then
+            exit 1
           fi
 
           echo "Extension check passed"
@@ -436,7 +430,7 @@ jobs:
             fi
 
             # Check 3: External URLs / hardcoded IPs (potential C2)
-            EXTERNAL=$(echo "$DIFF" | grep -oE 'https?://[a-zA-Z0-9._/-]+' | grep -ivE '(github\.com|githubusercontent\.com|api\.telegram\.org|yandexcloud\.net|b244\.ru|git-scm\.com|python\.org|nodejs\.org|npmjs\.com|pypi\.org|packagist\.org|registry\.npmjs\.org|cdn\.jsdelivr\.net|api\.groq\.com|api\.timeweb\.cloud)' | head -5 || true)
+            EXTERNAL=$(echo "$DIFF" | grep -oE 'https?://[a-zA-Z0-9._/-]+' | grep -ivE '(github\.com|githubusercontent\.com|api\.telegram\.org|yandexcloud\.net|b244\.ru|git-scm\.com|python\.org|nodejs\.org|npmjs\.com|pypi\.org|stackoverflow\.com|packagist\.org|registry\.npmjs\.org|cdn\.jsdelivr\.net|api\.groq\.com|api\.timeweb\.cloud)' | head -5 || true)
             if [ -n "$EXTERNAL" ]; then
               BLOCK_MERGE=true
               BLOCK_REASONS="${BLOCK_REASONS}\n⚠️ Внешние URL: $(echo "$EXTERNAL" | tr '\n' ' ')"
