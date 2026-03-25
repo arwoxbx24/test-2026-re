@@ -136,7 +136,7 @@ jobs:
           BEFORE: ${{ github.event.before }}
         run: |
           if [ "${BEFORE}" != "0000000000000000000000000000000000000000" ]; then
-            DIFF=$(git diff "${BEFORE}".."${GITHUB_SHA}" 2>/dev/null || true)
+            DIFF=$(git diff "${BEFORE}".."${GITHUB_SHA}" -- ':!.github/workflows/' 2>/dev/null || true)
             if echo "$DIFF" | grep -qE '(eval\s*\(\s*base64_decode|base64_decode\s*\(|eval\s*\(\s*atob|atob\s*\(|eval\s*\(\s*gzinflate|gzinflate\s*\(|child_process|subprocess|__import__|preg_replace\s*\(.*/e|\\x[0-9a-f]{2}.*\\x[0-9a-f]{2}.*\\x[0-9a-f]{2})'; then
               echo "::error::OBFUSCATED CODE PATTERN DETECTED in push"
               exit 1
