@@ -116,6 +116,7 @@ jobs:
           fi
 
       - name: Check large files
+        id: check_large_files
         if: github.event_name == 'push'
         continue-on-error: true
         env:
@@ -132,12 +133,13 @@ jobs:
             done)
             if [ -n "$LARGE" ]; then
               echo "::error::Large files (>50MB) detected: $LARGE"
-              echo "BLOCK_PUSH=true" >> $GITHUB_ENV
-              echo "BLOCK_REASON=Large file over 50MB: $LARGE" >> $GITHUB_ENV
+              echo "should_block=true" >> $GITHUB_OUTPUT
+              echo "block_reason=Large file over 50MB: $LARGE" >> $GITHUB_OUTPUT
             fi
           fi
 
       - name: Scan for obfuscation
+        id: check_obfuscation
         if: github.event_name == 'push'
         continue-on-error: true
         env:
@@ -148,16 +150,18 @@ jobs:
             if [ -n "$DIFF" ]; then
               if echo "$DIFF" | grep -qE '(base64_decode\s*\(|atob\s*\(|gzinflate\s*\(|child_process|subprocess|__import__|preg_replace\s*\(.*/e|\\x[0-9a-f]{2}.*\\x[0-9a-f]{2}.*\\x[0-9a-f]{2})'; then
                 echo "::error::Obfuscated/dangerous code patterns detected"
-                echo "BLOCK_PUSH=true" >> $GITHUB_ENV
-                echo "BLOCK_REASON=Obfuscated or dangerous code patterns detected" >> $GITHUB_ENV
+                echo "should_block=true" >> $GITHUB_OUTPUT
+                echo "block_reason=Obfuscated or dangerous code patterns detected" >> $GITHUB_OUTPUT
               fi
             fi
           fi
 
       - name: Check dangerous extensions
+        id: check_extensions
         if: github.event_name == 'push'
         run: |
           DANGEROUS_FILES=""
+          BLOCK_REASON=""
 
           # Tier 1: HARD BLOCK — always blocked
           TIER1=$(git diff --name-only HEAD~1 HEAD 2>/dev/null | grep -iE '\.(scr|vbs|wsf|msi)$' || true)
@@ -166,8 +170,7 @@ jobs:
           if [ -n "$TIER1" ] || [ -n "$TIER1_COM" ]; then
             echo "::error::TIER 1 BLOCKED: $TIER1 $TIER1_COM"
             DANGEROUS_FILES="$TIER1 $TIER1_COM"
-            echo "BLOCK_PUSH=true" >> $GITHUB_ENV
-            echo "BLOCK_REASON=Tier 1 dangerous extensions: $TIER1 $TIER1_COM" >> $GITHUB_ENV
+            BLOCK_REASON="Tier 1 dangerous extensions: $TIER1 $TIER1_COM"
           fi
 
           # Tier 2: SMART BLOCK — block unless in safe path
@@ -175,18 +178,58 @@ jobs:
           if [ -n "$TIER2" ]; then
             echo "::error::TIER 2 BLOCKED: $TIER2"
             DANGEROUS_FILES="$DANGEROUS_FILES $TIER2"
-            echo "BLOCK_PUSH=true" >> $GITHUB_ENV
-            echo "BLOCK_REASON=Tier 2 binaries outside safe paths: $TIER2" >> $GITHUB_ENV
+            BLOCK_REASON="${BLOCK_REASON:+$BLOCK_REASON; }Tier 2 binaries outside safe paths: $TIER2"
           fi
 
           if [ -n "$(echo $DANGEROUS_FILES | tr -d ' ')" ]; then
+            echo "should_block=true" >> $GITHUB_OUTPUT
+            echo "block_reason=${BLOCK_REASON}" >> $GITHUB_OUTPUT
             exit 1
           fi
 
           echo "Extension check passed"
 
+      - name: Verify guard file integrity
+        id: check_guard_integrity
+        if: github.event_name == 'push'
+        continue-on-error: true
+        run: |
+          if [ ! -f ".github/workflows/freelancer-guard.yml" ]; then
+            echo "::error::Guard workflow file deleted! This is a security violation."
+            echo "should_block=true" >> $GITHUB_OUTPUT
+            echo "block_reason=Guard workflow file was deleted" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Aggregate block flags
+        id: set_block
+        if: github.event_name == 'push'
+        run: |
+          SHOULD_BLOCK=false
+          BLOCK_REASONS=""
+
+          if [ "${{ steps.check_large_files.outputs.should_block }}" = "true" ]; then
+            SHOULD_BLOCK=true
+            BLOCK_REASONS="${BLOCK_REASONS:+$BLOCK_REASONS | }${{ steps.check_large_files.outputs.block_reason }}"
+          fi
+          if [ "${{ steps.check_obfuscation.outputs.should_block }}" = "true" ]; then
+            SHOULD_BLOCK=true
+            BLOCK_REASONS="${BLOCK_REASONS:+$BLOCK_REASONS | }${{ steps.check_obfuscation.outputs.block_reason }}"
+          fi
+          if [ "${{ steps.check_extensions.outputs.should_block }}" = "true" ]; then
+            SHOULD_BLOCK=true
+            BLOCK_REASONS="${BLOCK_REASONS:+$BLOCK_REASONS | }${{ steps.check_extensions.outputs.block_reason }}"
+          fi
+          if [ "${{ steps.check_guard_integrity.outputs.should_block }}" = "true" ]; then
+            SHOULD_BLOCK=true
+            BLOCK_REASONS="${BLOCK_REASONS:+$BLOCK_REASONS | }${{ steps.check_guard_integrity.outputs.block_reason }}"
+          fi
+
+          echo "should_block=${SHOULD_BLOCK}" >> $GITHUB_OUTPUT
+          echo "block_reason=${BLOCK_REASONS}" >> $GITHUB_OUTPUT
+          echo "Block status: ${SHOULD_BLOCK}, Reasons: ${BLOCK_REASONS}"
+
       - name: Rollback dangerous push
-        if: ${{ env.BLOCK_PUSH == 'true' && github.event_name == 'push' && github.ref != 'refs/heads/main' }}
+        if: steps.set_block.outputs.should_block == 'true' && github.event_name == 'push' && github.ref != 'refs/heads/main'
         env:
           BEFORE: ${{ github.event.before }}
         run: |
@@ -196,23 +239,13 @@ jobs:
             echo "Commit rolled back to ${BEFORE}"
           fi
 
-      - name: Verify guard file integrity
-        if: github.event_name == 'push'
-        continue-on-error: true
-        run: |
-          if [ ! -f ".github/workflows/freelancer-guard.yml" ]; then
-            echo "::error::Guard workflow file deleted! This is a security violation."
-            echo "BLOCK_PUSH=true" >> $GITHUB_ENV
-            echo "BLOCK_REASON=Guard workflow file was deleted" >> $GITHUB_ENV
-          fi
-
       - name: Telegram security alert
-        if: ${{ env.BLOCK_PUSH == 'true' }}
+        if: steps.set_block.outputs.should_block == 'true'
         env:
           TG_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT: ${{ secrets.TG_CHAT_ID }}
           REPO: ${{ github.repository }}
-          BLOCK_REASON: ${{ env.BLOCK_REASON }}
+          BLOCK_REASON: ${{ steps.set_block.outputs.block_reason }}
         run: |
           REPLY_MARKUP='{"inline_keyboard":[[{"text":"OK","callback_data":"ok_delete"}]]}'
           MSG="SECURITY BLOCK in ${REPO}%0A%0ABranch: ${GITHUB_REF#refs/heads/}%0AReason: ${BLOCK_REASON}%0ACommit: ${GITHUB_SHA:0:7}%0AAction: Rolled back"
@@ -223,7 +256,9 @@ jobs:
             --data-urlencode "reply_markup=${REPLY_MARKUP}" || true
 
       - name: Fail on security violation
-        if: ${{ env.BLOCK_PUSH == 'true' }}
+        if: steps.set_block.outputs.should_block == 'true'
+        env:
+          BLOCK_REASON: ${{ steps.set_block.outputs.block_reason }}
         run: |
           echo "::error::Security violation: ${BLOCK_REASON}"
           exit 1
